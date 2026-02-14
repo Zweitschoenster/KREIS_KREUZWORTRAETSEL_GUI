@@ -25,20 +25,29 @@ OFFSET_X_BASE   = 4000
 ROW_COLORS = [0xCCE5FF, 0xFBE5B6, 0xCCFFCC]
 CHAR_HEIGHT = 16
 
-# Wortspalten (gleicher Sheet) + used-Spalten sind +3/+4
+# Wortspalten (gleicher Sheet)
+# Wort steht in COL, Timestamp (Eintrag) steht in COL+1 (existiert schon)
+# Used-Wort im Kreis steht in COL+3, Used-Timestamp (30 Tage) in COL+4
 WORDLIST_COLS = ["AG", "AN", "AU", "BB"]
 RANDOM_DAYS_LOCK = 30
 WORDLIST_ROW_START = 4
 WORDLIST_ROW_END   = 600
 
-# Debug: True zeigt eine Info, wenn Random-Kandidaten = 0
+# J2: Zielanzahl automatisch zu füllender Halbkreise (1..6)
 DEBUG = False
+
 
 # =========================
 # UNO HELPERS
 # =========================
 def _get_doc():
     return XSCRIPTCONTEXT.getDocument()
+
+def _get_sheet(doc):
+    return doc.Sheets.getByName(SHEET_NAME)
+
+def _get_draw_page(sheet):
+    return sheet.DrawPage
 
 def _msgbox(doc, title, message):
     try:
@@ -51,14 +60,8 @@ def _msgbox(doc, title, message):
     except Exception:
         pass
 
-def _get_sheet(doc):
-    return doc.Sheets.getByName(SHEET_NAME)
-
-def _get_draw_page(sheet):
-    return sheet.DrawPage
-
 def _col0_from_letters(col_letters: str) -> int:
-    s = col_letters.strip().upper()
+    s = (col_letters or "").strip().upper()
     n = 0
     for ch in s:
         n = n * 26 + (ord(ch) - 64)
@@ -67,8 +70,7 @@ def _col0_from_letters(col_letters: str) -> int:
 def _cell(sheet, col0, row_1based):
     return sheet.getCellByPosition(col0, row_1based - 1)
 
-def _a1(col0, row0):
-    # row0 = 0-based
+def _a1(col0, row0):  # row0 0-based
     col = ""
     n = col0 + 1
     while n:
@@ -83,6 +85,7 @@ def _row_top_y(sheet, row_1based):
         y += rows.getByIndex(i).Height
     return y
 
+
 # =========================
 # TEXT NORMALISIERUNG (Umlaute bleiben)
 # =========================
@@ -95,6 +98,7 @@ def _normalize_keep_umlauts_no_spaces(s: str) -> str:
     x = _to_upper_visual(x)
     allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜẞ")
     return "".join(ch for ch in x if ch in allowed)
+
 
 # =========================
 # J2 lesen (1–6)
@@ -112,26 +116,29 @@ def _read_j2_target(sheet, default=6):
     if v > 6: v = 6
     return v
 
+
 # =========================
-# Regeln: EF und GRID
+# EF / GRID Regeln
 # =========================
 def _pairs_from_ef_word(sheet, ef_row_1based, label):
     """
-    EF: Meldung nur <5 oder >8
-    >8: kürzen (auch in Zelle)
+    EF:
+    - wenn leer: None (nicht benutzt)
+    - >8: kürzen (auch in Zelle)
+    - <5: MELDUNG, aber EF wird IGNORIERT (Fallback auf Grid/Random)
     """
     msgs = []
     ef_cell = _cell(sheet, 4, ef_row_1based)  # E (merged)
     raw = (ef_cell.getString() or "").strip()
     if not raw:
-        return None, msgs, True  # None = "nicht benutzt"
+        return None, msgs  # None = "nicht benutzt"
 
     norm = _normalize_keep_umlauts_no_spaces(raw)
     n = len(norm)
-    ok = True
 
+    # >8 kürzen
     if n > 8:
-        msgs.append(f"{label}: >8 Zeichen → auf 8 gekürzt")
+        msgs.append(f"{label}: >8 Zeichen ('{norm}') → auf 8 gekürzt")
         norm = norm[:8]
         ef_cell.setString(norm)
         n = 8
@@ -139,10 +146,12 @@ def _pairs_from_ef_word(sheet, ef_row_1based, label):
         if norm != raw:
             ef_cell.setString(norm)
 
+    # <5 => NICHT gültig für EF, aber KEIN Abbruch!
     if n < 5:
-        msgs.append(f"{label}: <5 Zeichen → nicht gültig")
-        ok = False
+        msgs.append(f"{label}: '{norm}' hat {n} Zeichen (<5) → EF wird ignoriert (Grid/Random)")
+        return None, msgs  # <- wichtig: None bedeutet "EF nicht verwenden"
 
+    # 5..8 => in Paare
     pairs = []
     for i in range(0, 8, 2):
         chunk = norm[i:i+2]
@@ -152,15 +161,17 @@ def _pairs_from_ef_word(sheet, ef_row_1based, label):
             pairs.append(chunk + " ")
         else:
             pairs.append("  ")
-    return pairs, msgs, ok
+
+    return pairs, msgs
+
 
 def _pairs_from_grid_row(sheet, row_1based):
     """
     Grid C..F:
-    0 Zeichen ok
-    1 Zeichen ok (2. fehlt) -> Meldung
-    2 Zeichen ok
-    >2 -> kürzen auf 2 -> Meldung
+    - 0 Zeichen => "  "
+    - 1 Zeichen => "<X> " + Hinweis
+    - 2 Zeichen => ok
+    - >2 => Kürzen auf 2 + Hinweis mit Original und Cut
     """
     msgs = []
     pairs = []
@@ -175,7 +186,7 @@ def _pairs_from_grid_row(sheet, row_1based):
             pairs.append("  ")
         elif len(norm) == 1:
             pairs.append(norm + " ")
-            msgs.append(f"{_a1(col0,row0)}: 1 Buchstabe → 2. fehlt")
+            msgs.append(f"{_a1(col0,row0)}: 1 Buchstabe → 2. fehlt ('{norm} ')")
             if raw != norm:
                 c.setString(norm)
         elif len(norm) == 2:
@@ -190,18 +201,15 @@ def _pairs_from_grid_row(sheet, row_1based):
 
     return pairs, msgs
 
+
 def _grid_all_empty(pairs):
-    for p in pairs:
-        if (p or "").strip():
-            return False
-    return True
+    return all(not (p or "").strip() for p in pairs)
+
 
 def _half_has_manual_input(sheet, ef_row_1based, grid_row_1based):
-    # EF nicht leer?
     ef = (_cell(sheet, 4, ef_row_1based).getString() or "").strip()
     if ef:
         return True
-    # Grid irgendwas?
     row0 = grid_row_1based - 1
     for col0 in range(2, 6):
         raw = (sheet.getCellByPosition(col0, row0).getString() or "").strip()
@@ -209,8 +217,9 @@ def _half_has_manual_input(sheet, ef_row_1based, grid_row_1based):
             return True
     return False
 
+
 # =========================
-# RANDOM aus Wortspalten (nur 5..8), 30 Tage Sperre
+# RANDOM aus Wortspalten (5..8), 30 Tage Sperre
 # =========================
 def _parse_ts(ts_str: str):
     ts_str = (ts_str or "").strip()
@@ -237,7 +246,7 @@ def _pick_random_word(sheet):
 
     for col_letters in WORDLIST_COLS:
         col0 = _col0_from_letters(col_letters)
-        for r in range(WORDLIST_ROW_START, WORDLIST_ROW_END):
+        for r in range(WORDLIST_ROW_START, WORDLIST_ROW_END + 1):
             w = (_cell(sheet, col0, r).getString() or "").strip()
             if not w:
                 continue
@@ -250,44 +259,36 @@ def _pick_random_word(sheet):
                 candidates.append((norm, col_letters, r))
 
     if DEBUG:
-        doc = _get_doc()
-        _msgbox(doc, "DEBUG", f"Random-Kandidaten: {len(candidates)}")
+        _msgbox(_get_doc(), "DEBUG", f"Random-Kandidaten: {len(candidates)}")
 
     if not candidates:
         return None, None, None
 
     return random.choice(candidates)
 
+
 # =========================
 # SHAPES: löschen / zeichnen
 # =========================
 def delete_all_circles(*args):
     """
-    Abrissbirne: löscht ALLE Shapes auf dem Sheet (außer Controls).
+    Löscht alle Shapes auf dem Sheet (außer Controls).
     """
     doc = _get_doc()
     sheet = _get_sheet(doc)
     dp = sheet.DrawPage
 
-    removed = 0
-    skipped = 0
     for i in range(dp.getCount() - 1, -1, -1):
         sh = dp.getByIndex(i)
         try:
             if sh.supportsService("com.sun.star.drawing.ControlShape"):
-                skipped += 1
                 continue
         except Exception:
             pass
         try:
             dp.remove(sh)
-            removed += 1
         except Exception:
             pass
-
-    # Keine Msgbox erzwingen (nur wenn DEBUG)
-    if DEBUG:
-        _msgbox(doc, "Löschen", f"Entfernt: {removed}\nControls: {skipped}")
 
 def _mark_shape(shape, name_suffix):
     try:
@@ -336,8 +337,8 @@ def _draw_line(doc, draw_page, x1, y1, x2, y2, name_suffix):
     line = doc.createInstance("com.sun.star.drawing.LineShape")
     _mark_shape(line, name_suffix)
     draw_page.add(line)
-    line.Position = Point(x1, y1)
-    line.Size = Size(x2 - x1, y2 - y1)
+    line.Position = Point(int(x1), int(y1))
+    line.Size = Size(int(x2 - x1), int(y2 - y1))
     line.LineColor = 0x000000
 
 def _draw_circle(doc, draw_page, x, y, size, fill_color, quad, idx_tag):
@@ -345,8 +346,8 @@ def _draw_circle(doc, draw_page, x, y, size, fill_color, quad, idx_tag):
     _mark_shape(circle, f"circle_{idx_tag}")
     draw_page.add(circle)
 
-    circle.Position  = Point(x, y)
-    circle.Size      = Size(size, size)
+    circle.Position  = Point(int(x), int(y))
+    circle.Size      = Size(int(size), int(size))
     circle.FillColor = fill_color
     circle.LineColor = 0x000000
 
@@ -364,21 +365,23 @@ def _draw_circle(doc, draw_page, x, y, size, fill_color, quad, idx_tag):
     for i, ((tcx,tcy), ch) in enumerate(zip(centers, quad), start=1):
         _draw_text_center(doc, draw_page, tcx, tcy, ch, f"text_{idx_tag}_{i}")
 
+
 # =========================
-# Hauptlogik: Halbkreis -> Paare
+# Halbkreis -> Paare (EF -> Grid -> Random)
 # =========================
 def _pairs_for_half(sheet, title, ef_row, grid_row, state):
     """
-    state:
-      remaining_random: wie viele Wörter noch automatisch gefüllt werden dürfen
-      msgs: Sammelliste
+    Priorität:
+    1) EF (nur wenn >=5 Zeichen)
+    2) Grid (wenn dort irgendwas steht)
+    3) Random (wenn erlaubt)
     """
-    # 1) EF
-    pairs, m, ok = _pairs_from_ef_word(sheet, ef_row, f"EF{ef_row}")
+    # 1) EF (nur wenn gültig >=5, sonst None)
+    pairs, m = _pairs_from_ef_word(sheet, ef_row, f"EF{ef_row}")
     if m:
         state["msgs"].extend([f"{title}: {x}" for x in m])
     if pairs is not None:
-        return pairs, ok, True  # used_word=True (zählt als Wort)
+        return pairs  # EF genutzt
 
     # 2) Grid
     gpairs, gm = _pairs_from_grid_row(sheet, grid_row)
@@ -386,24 +389,21 @@ def _pairs_for_half(sheet, title, ef_row, grid_row, state):
         state["msgs"].extend([f"{title}: {x}" for x in gm])
 
     if not _grid_all_empty(gpairs):
-        return gpairs, True, True  # used_word=True
+        return gpairs  # Grid genutzt
 
-    # 3) Random (nur wenn remaining_random > 0)
+    # 3) Random
     if state["remaining_random"] <= 0:
-        return ["  ","  ","  ","  "], True, False
+        return ["  ", "  ", "  ", "  "]  # leer
 
     w, col_letters, row1 = _pick_random_word(sheet)
     if not w:
-        # keine Kandidaten -> dann leer lassen, aber als "ok"
-        # (optional: Meldung nur wenn DEBUG)
         if DEBUG:
             state["msgs"].append(f"{title}: keine Random-Kandidaten gefunden")
-        return ["  ","  ","  ","  "], True, False
+        return ["  ", "  ", "  ", "  "]
 
     _mark_word_used(sheet, col_letters, row1, w)
     state["remaining_random"] -= 1
 
-    # Wort in Paare teilen (ohne in EF zu schreiben)
     pairs = []
     for i in range(0, 8, 2):
         chunk = w[i:i+2]
@@ -413,50 +413,44 @@ def _pairs_for_half(sheet, title, ef_row, grid_row, state):
             pairs.append(chunk + " ")
         else:
             pairs.append("  ")
-    return pairs, True, True
+    return pairs
+
 
 # =========================
-# Button: immer neu zeichnen
+# BUTTON-MAKRO (FIX)
 # =========================
 def run_wordspiel_button(*args):
+    """
+    Fix: Erst prüfen/Paare bauen -> dann löschen & zeichnen.
+    Dadurch bleiben Kreise sichtbar, wenn EF ungültig ist.
+    """
     doc = _get_doc()
     sheet = _get_sheet(doc)
     dp = _get_draw_page(sheet)
-    
-    # _msgbox(_get_doc(), "TEST", "Dieses Makro läuft gerade")
 
-
-    # 1) Ziel J2
     target = _read_j2_target(sheet, default=6)
 
-    # 2) Bereits manuell belegt zählen (EF oder Grid)
-    already = 0
     halves = []
     for (title, ef_top, grid_top, grid_bot, ef_bot) in GROUPS:
         halves.append((title, ef_top, grid_top))
         halves.append((title, ef_bot, grid_bot))
+
+    already = 0
     for (_t, ef_r, grid_r) in halves:
         if _half_has_manual_input(sheet, ef_r, grid_r):
             already += 1
 
-    remaining_random = target - already
-    if remaining_random < 0:
-        remaining_random = 0
-
+    remaining_random = max(0, target - already)
     state = {"remaining_random": remaining_random, "msgs": []}
 
     doc.lockControllers()
     try:
-        # immer neu zeichnen (damit nichts "nicht gefunden" wird)
+        # jetzt immer neu zeichnen
         delete_all_circles()
 
         for gi, (title, ef_top, grid_top, grid_bot, ef_bot) in enumerate(GROUPS):
-            top_pairs, ok1, used1 = _pairs_for_half(sheet, title, ef_top, grid_top, state)
-            bot_pairs, ok2, used2 = _pairs_for_half(sheet, title, ef_bot, grid_bot, state)
-
-            # wenn EF ungültig (<5) irgendwo: abbrechen (wie gewünscht)
-            if not (ok1 and ok2):
-                break
+            top_pairs = _pairs_for_half(sheet, title, ef_top, grid_top, state)
+            bot_pairs = _pairs_for_half(sheet, title, ef_bot, grid_bot, state)
 
             y = _row_top_y(sheet, ef_top)
             fill = ROW_COLORS[gi] if gi < len(ROW_COLORS) else ROW_COLORS[-1]
@@ -481,11 +475,11 @@ def run_wordspiel_button(*args):
         except Exception:
             pass
 
-    # Meldung nur wenn nötig (Grid 1 oder >2, EF <5 oder >8)
     if state["msgs"]:
         _msgbox(doc, "Hinweise", "\n".join(state["msgs"]))
 
     return True
+
 
 # =========================
 # EXPORTS
