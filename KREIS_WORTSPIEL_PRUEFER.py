@@ -30,6 +30,12 @@ SHEET_NAME = "KREIS_WORTSPIEL"
 
 CELL_HEADER_AA3 = "AA3"
 CELL_LENGTH_AB3 = "AB3"
+HEADER_ROW = 3
+HEADER_START_COL = "AA"
+HEADER_EMPTY_STREAK_STOP = 22
+TS_HEADER_TEXT = "Aufgenommen am:"
+
+
 
 WORDS_COL = "AB"     # AB4...
 RESULT_COL = "AC"    # AC4...
@@ -219,47 +225,94 @@ def write_count_header(cell, label: str, n: int) -> None:
     num_cursor.gotoRange(end, True)
     num_cursor.CharWeight = 150.0  # bold
 
-
 def update_word_counts_row2(sheet, target_len: int) -> None:
-    """
-    Updates counts in row 2:
-    - For the used word columns (list_col, ts_col, optional list_col2/ts_col2)
-    - Also updates AB2 for input count in AB4..
-    """
-    # 1) Inputs in AB
+    # (Optional) AB2 Eingaben – wenn du das behalten willst:
     n_inputs = count_non_empty_in_col(sheet, WORDS_COL, START_ROW)
     write_count_header(get_cell(sheet, "AB2"), "Anzahl Eingaben:", n_inputs)
 
-    # 2) Word lists depending on length
-    list_col = get_list_start_col_for_length(target_len)
-    ts_col = shift_col(list_col, 1)
+    # Hauptblöcke (Startspalten) für Längen 5..12
+    for length in range(MIN_LEN, MAX_LEN + 1):
+        list_col = get_list_start_col_for_length(length)
+        n_words = count_non_empty_in_col(sheet, list_col, START_ROW)
 
-    n_words = count_non_empty_in_col(sheet, list_col, START_ROW)
-    write_count_header(get_cell(sheet, f"{list_col}2"), "Anzahl Wörter:", n_words)
+        if n_words > 0:
+            write_count_header(get_cell(sheet, f"{list_col}2"), "Anzahl Wörter:", n_words)
+        else:
+            get_cell(sheet, f"{list_col}2").String = ""   # leer lassen statt 0
 
-    # Timestamp-Spalte daneben (optional auch zählen – meistens nicht nötig)
-    # n_ts = count_non_empty_in_col(sheet, ts_col, START_ROW)
-    # write_count_header(get_cell(sheet, f"{ts_col}2"), "Anzahl TS:", n_ts)
+    # Sekundärer 8er-Block (BI)
+    sec8 = get_secondary_list_col_for_len8()
+    n_words2 = count_non_empty_in_col(sheet, sec8, START_ROW)
 
-    # Bei Länge 8 zusätzlich zweite Liste
-    if target_len == 8:
-        list_col2 = get_secondary_list_col_for_len8()
-        ts_col2 = shift_col(list_col2, 1)
-
-        n_words2 = count_non_empty_in_col(sheet, list_col2, START_ROW)
-        write_count_header(get_cell(sheet, f"{list_col2}2"), "Anzahl Wörter:", n_words2)
-
-        # optional TS count
-        # n_ts2 = count_non_empty_in_col(sheet, ts_col2, START_ROW)
-        # write_count_header(get_cell(sheet, f"{ts_col2}2"), "Anzahl TS:", n_ts2)
+    if n_words2 > 0:
+        write_count_header(get_cell(sheet, f"{sec8}2"), "Anzahl Wörter:", n_words2)
+    else:
+        get_cell(sheet, f"{sec8}2").String = ""
 
 
 # ============================================================
 # HEADERS / BASIC FORMATS
-# ============================================================
-
+# ============================================================ 
 def set_headers(sheet) -> None:
-    get_cell(sheet, CELL_HEADER_AA3).String = "Anzahl Buchstaben \n pro Wort"
+    label = "Anzahl Buchstaben \n pro Wort"
+
+    # ------------------------------------------------------------
+    # 1) Letzte relevante Header-Spalte finden:
+    #    Wir laufen in HEADER_ROW ab HEADER_START_COL nach rechts.
+    #    Sobald HEADER_EMPTY_STREAK_STOP Header-Zellen hintereinander leer sind,
+    #    brechen wir ab. Die letzte nicht-leere Headerzelle ist unser Ende.
+    # ------------------------------------------------------------
+    empty_streak = 0
+    col_idx0 = col_to_index(HEADER_START_COL) - 1          # 0-basiert
+    last_filled_col_idx0 = col_idx0 - 1                    # falls AA3 direkt leer wäre
+
+    while True:
+        col_letter = index_to_col(col_idx0 + 1)            # zurück nach "AA", "AB", ...
+        txt = (get_cell(sheet, f"{col_letter}{HEADER_ROW}").String or "").strip()
+
+        if txt == "":
+            empty_streak += 1
+            if empty_streak >= HEADER_EMPTY_STREAK_STOP:
+                break
+        else:
+            empty_streak = 0
+            last_filled_col_idx0 = col_idx0
+
+        col_idx0 += 1
+
+    # Wenn wir gar keine gefüllte Headerzelle gefunden haben, nichts tun
+    if last_filled_col_idx0 < 0:
+        return
+
+    end_col_idx0 = last_filled_col_idx0
+
+    # ------------------------------------------------------------
+    # 2) Ab AB (= WORDS_COL) bis zur gefundenen Endspalte laufen
+    #    und nur in Spalten mit Inhalt ab START_ROW den Header setzen.
+    #    Überschriften, die schon existieren (z.B. "Wörter in AU ..."),
+    #    werden NICHT überschrieben.
+    # ------------------------------------------------------------
+    start_col_idx0 = col_to_index(WORDS_COL) - 1  # AB -> 0-basiert
+
+    # Falls das Ende links von AB liegt: nichts zu tun
+    if end_col_idx0 < start_col_idx0:
+        return
+
+    for c0 in range(start_col_idx0, end_col_idx0 + 1):
+        col_letter = index_to_col(c0 + 1)
+
+        # Prüfen: gibt es ab Zeile 4 (START_ROW) irgendeinen Inhalt in dieser Spalte?
+        last = get_last_row_with_content(sheet, col_letter, START_ROW)
+        if last < START_ROW:
+            continue
+
+        # Header nur setzen, wenn die Headerzelle leer ist (nichts überschreiben!)
+        hdr = get_cell(sheet, f"{col_letter}{HEADER_ROW}")
+        if (hdr.String or "").strip() == "":
+            hdr.String = label
+            hdr.CharWeight = 150.0
+            hdr.IsTextWrapped = True
+
 
 def apply_basic_formats(sheet) -> None:
     aa3 = get_cell(sheet, CELL_HEADER_AA3)
@@ -278,6 +331,31 @@ def apply_basic_formats(sheet) -> None:
     rng_ab.CharHeight = AB_INPUT_PT
     rng_ab.HoriJustify = uno.Enum("com.sun.star.table.CellHoriJustify", "CENTER")
     rng_ab.VertJustify = uno.Enum("com.sun.star.table.CellVertJustify", "CENTER")
+    
+def set_ts_header(sheet, word_start_col: str) -> None:
+    """
+    Setzt den Timestamp-Header in Zeile 3 rechts neben der Wortspalte
+    (z.B. AG -> AH3), aber überschreibt nichts, wenn schon Text da ist.
+    """
+    ts_hdr = get_cell(sheet, f"{shift_col(word_start_col, 1)}{HEADER_ROW}")
+    """
+    Das heißt: nicht überschreiben
+    ts_hdr = get_cell(sheet, f"{shift_col(word_start_col, 1)}{HEADER_ROW}")
+    if (ts_hdr.String or "").strip() != "":
+        return
+    """
+    # Wenn da irgendwas anderes steht: überschreiben
+    current = (ts_hdr.String or "").strip()
+    if current == TS_HEADER_TEXT.strip():
+        return  # ist schon korrekt
+
+    ts_hdr.String = TS_HEADER_TEXT
+    ts_hdr.CharWeight = 150.0
+    ts_hdr.IsTextWrapped = True
+    ts_hdr.HoriJustify = 2
+    ts_hdr.VertJustify = 1
+    ts_hdr.CharHeight = 12.0
+
 
 # ============================================================
 # VALIDATION / INPUT
@@ -567,22 +645,28 @@ def format_all_word_blocks(sheet):
 
         # Header in <start_col>3 setzen (damit AU3 sicher gesetzt ist)
         write_list_header_with_bold_number(get_cell(sheet, f"{start_col}3"), length, start_col)
+        set_ts_header(sheet, start_col)
 
         # Wortspalte
-        _format_col_range(sheet, start_col, WORD_PT, "RIGHT", "CENTER", WORD_COL_WIDTH_CM)
+        _format_col_range(sheet, start_col, WORD_PT, "CENTER", "CENTER", WORD_COL_WIDTH_CM)
 
         # 4 Nachbarspalten (Timestamp + 3 weitere)
         for off in (1, 2, 3, 4):
             c = shift_col(start_col, off)
-            _format_col_range(sheet, c, META_PT, "RIGHT", "CENTER", META_COL_WIDTH_CM)
+            _format_col_range(sheet, c, META_PT, "CENTER", "CENTER", META_COL_WIDTH_CM)
 
     # Sekundärblock für Länge 8 (BI) – optional, aber sauber inkl. Header/Format
     sec8 = get_secondary_list_col_for_len8()
     write_list_header_with_bold_number(get_cell(sheet, f"{sec8}3"), 8, sec8)
-    _format_col_range(sheet, sec8, WORD_PT, "RIGHT", "CENTER", WORD_COL_WIDTH_CM)
+    set_ts_header(sheet, sec8)
+    
+    # Wortspalte
+    _format_col_range(sheet, sec8, WORD_PT, "CENTER", "CENTER", WORD_COL_WIDTH_CM)
+
+    # 4 Nachbarspalten (Timestamp + 3 weitere)
     for off in (1, 2, 3, 4):
         c = shift_col(sec8, off)
-        _format_col_range(sheet, c, META_PT, "RIGHT", "CENTER", META_COL_WIDTH_CM)
+        _format_col_range(sheet, c, META_PT, "CENTER", "CENTER", META_COL_WIDTH_CM)
 
 def format_count_cells_row2(sheet, cols: list[str]) -> None:
     for c in cols:
@@ -736,12 +820,55 @@ def init_kreis_wortspiel(*args):
 
         # >>> alle Wortspalten-Header + Formatierung (inkl. AU3)
         format_all_word_blocks(sheet)
-        format_count_cells_row2(sheet, ["AB", "AG", "AH", "AN", "AO", "AU", "AV"])
+        
+        # format_count_cells_row2(sheet, ["AB", "AG", "AH", "AN", "AO", "AU", "AV"]) diese Zeile wurde ersetzt durch den unteren Block und ist dadurch flexibler geworden
+        
+        cols = ["AB"]  # AB2 Eingaben
+        for length in range(MIN_LEN, MAX_LEN + 1):
+            cols.append(get_list_start_col_for_length(length))  # AG/AN/AU/...
+        cols.append(get_secondary_list_col_for_len8())          # BI-Block       
+        format_count_cells_row2(sheet, cols)
+ 
+        log("format_count_cells_row2 -> Spaltenliste cols = " + ", ".join(cols))
+        
+        format_count_cells_row2(sheet, cols)
 
+        # Counts auch beim Init aktualisieren (wenn Listen schon gefüllt sind)
+        ensure_default_length(sheet)
+        target_len = read_length_setting(sheet)   # braucht update_word_counts_row2 wegen AB2 (Eingaben)
+        update_word_counts_row2(sheet, target_len)
 
         INITIALIZED = True
     finally:
         INIT_RUNNING = False
+
+# ============================================================
+# CLEAR INPUT & RESULT RANGE (AB4:AC500)
+# ============================================================        
+        
+def clear_input_and_results_range(*args):
+    """
+    Löscht Inhalte in AB4:AC500 (Eingaben + Ergebnis),
+    OHNE Formatierung zu verändern.
+    """
+    ctx = get_context()
+    desktop = get_desktop(ctx)
+    doc = get_document(desktop)
+    assert_calc_document(doc)
+    sheet = get_sheet(doc, SHEET_NAME)
+
+    # Falls gerade eine Zelle im Editmodus ist: erst committen
+    commit_edit_by_parking_left_of_last_word(doc, sheet, words_col=WORDS_COL, start_row=START_ROW)
+
+    rng = sheet.getCellRangeByName("AB4:AC500")
+
+    # 23 = löscht Inhalte (Value, String, Formel, Notizen, etc.), lässt Formatierung stehen
+    rng.clearContents(23)
+    sheet.getCellRangeByName("AB2").clearContents(23)
+
+    # optional: Cursor wieder auf AB4 setzen
+    set_cursor_to_cell(doc, sheet, "AB4")
+        
 
 # ============================================================
 # ENTRY POINT
@@ -783,4 +910,5 @@ def check_words_for_kreis_wordgame(*args):
 g_exportedScripts = (
     init_kreis_wortspiel,
     check_words_for_kreis_wordgame,
+    clear_input_and_results_range,
 )

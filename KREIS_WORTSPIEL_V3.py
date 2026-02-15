@@ -10,6 +10,9 @@ from com.sun.star.awt import Point, Size
 SHEET_NAME = "KREIS_WORTSPIEL"
 MARK_DESC  = "KREIS_Wortspiel_GUI_V3"
 
+SUPPRESS_AUTO_RUN = False
+
+
 # Kreise: 3 Gruppen, je Gruppe 4 Kreise (C..F)
 GROUPS = [
     ("Gruppe 1",  3,  4,  5,  6),
@@ -29,7 +32,7 @@ CHAR_HEIGHT = 16
 WORDLIST_COLS = ["AG", "AN", "AU", "BB"]
 RANDOM_DAYS_LOCK = 30
 WORDLIST_ROW_START = 4
-WORDLIST_ROW_END   = 600
+WORDLIST_ROW_END   = 500
 
 # Debug: True zeigt eine Info, wenn Random-Kandidaten = 0
 DEBUG = False
@@ -84,7 +87,7 @@ def _row_top_y(sheet, row_1based):
     return y
 
 # =========================
-# TEXT NORMALISIERUNG (Umlaute bleiben in Sheet, Kreise auch)
+# TEXT NORMALISIERUNG („Umlaute bleiben im Sheet; Kreise nutzen AE/OE/UE/SS“)
 # =========================
 def _to_upper_visual(s):
     return (s or "").replace("ß", "ẞ").upper()
@@ -155,14 +158,13 @@ def _read_j2_target(sheet, default=6):
 # =========================
 # Dispatch-Helper + “commit” + Cursor parken
 # =========================
-from com.sun.star.beans import PropertyValue
 
-def _dispatch(doc, cmd, props=()):
+def _dispatch(doc, cmd):
     ctx = XSCRIPTCONTEXT.getComponentContext()
     smgr = ctx.ServiceManager
     helper = smgr.createInstanceWithContext("com.sun.star.frame.DispatchHelper", ctx)
     frame = doc.CurrentController.Frame
-    helper.executeDispatch(frame, cmd, "", 0, tuple(props))
+    helper.executeDispatch(frame, cmd, "", 0, ())
 
 def _commit_current_cell_input(doc):
     # bestätigt ggf. aktive Eingabe (wie Enter)
@@ -170,30 +172,6 @@ def _commit_current_cell_input(doc):
         _dispatch(doc, ".uno:Enter")
     except Exception:
         pass
-
-def _park_cursor_in_empty_cell(doc, sheet):
-    """
-    Geht ans Ende des verwendeten Bereichs und springt zwei Spalten rechts
-    in Zeile 1 (0-based row=0). Das ist i.d.R. leer und stört nicht.
-    """
-    try:
-        cur = sheet.createCursor()
-        cur.gotoEndOfUsedArea(True)
-        end_col = cur.RangeAddress.EndColumn
-        # zwei Spalten rechts außerhalb "Used Area"
-        park_col = end_col + 2
-        park_row = 0  # Zeile 1
-        cell = sheet.getCellByPosition(park_col, park_row)
-        doc.CurrentController.select(cell)
-    except Exception:
-        # Fallback: einfach A1 (falls oben schiefgeht)
-        try:
-            cell = sheet.getCellRangeByName("A1")
-            doc.CurrentController.select(cell)
-        except Exception:
-            pass
-
-
 
 # =========================
 # Regeln: EF und GRID
@@ -252,7 +230,7 @@ def _pairs_from_grid_row(sheet, row_1based):
     - 0 Zeichen ok
     - 1 Zeichen ok -> Meldung
     - 2 Zeichen ok
-    - >2 -> kürzen auf 2 -> Meldung (mit Anzeige der 2 Zeichen)
+    - „>2: im Kreis werden nur die ersten 2 nach Kreis-Norm verwendet“
     """
     msgs = []
     pairs = []
@@ -498,6 +476,25 @@ def _rotate_one_circle_letters(draw_page, idx_tag: str, steps_cw: int):
     for sh, tx in zip(shapes, new_texts):
         _set_shape_text(sh, tx)
 
+def _rotate_block_if_two_random(draw_page, gi: int):
+    """
+    Dreht NUR die 4 Kreise einer Gruppe gi (b{gi}_c0..c3).
+    Wird automatisch aufgerufen, wenn oben+unten RANDOM waren.
+    0° ist erlaubt, aber höchstens 1 Kreis in diesem Block darf 0° haben
+    (es muss keiner 0° haben).
+    """
+    tags = [f"b{gi}_c{c}" for c in range(NUM_COLS)]
+
+    # Standard: alle drehen (90/180/270)
+    steps_map = {tag: random.choice([1, 2, 3]) for tag in tags}
+
+    # optional: genau ein Kreis darf 0° behalten
+    if random.choice([True, False]):
+        steps_map[random.choice(tags)] = 0
+
+    for tag, steps in steps_map.items():
+        _rotate_one_circle_letters(draw_page, tag, steps)
+
 
 # =========================
 # SHAPES: löschen / zeichnen
@@ -616,44 +613,89 @@ def _draw_circle(doc, draw_page, x, y, size, fill_color, quad, idx_tag):
 # =========================
 def _pairs_for_half(sheet, title, ef_row, grid_row, state):
     """
-    state:
-      remaining_random: wie viele Wörter noch automatisch gefüllt werden dürfen
-      msgs: Sammelliste
+    PRIORITÄTS-KETTE (wichtig zum Verstehen!):
+
+    1) EF    hat immer Vorrang: sobald EF nicht leer ist -> verwenden und RETURN.
+    2) GRID  nur wenn EF leer war: sobald Grid (C..F) nicht leer ist -> verwenden und RETURN.
+    3) RANDOM nur wenn EF und GRID leer waren UND noch Random erlaubt ist -> verwenden und RETURN.
+    4) EMPTY wenn nichts geht -> "leere" Paare zurückgeben.
+
+    Rückgabe:
+      pairs: 4 Einträge (je 2 Zeichen) für die 4 Kreise in dieser Halbgruppe
+      ok:    bei dir praktisch immer True
+      src:   "EF" | "GRID" | "RANDOM" | "EMPTY"
     """
-    # 1) EF (wenn nicht leer -> immer nutzen)
+
+    # ============================================================
+    # 1) EF (höchste Priorität)
+    # ============================================================
+    # _pairs_from_ef_word prüft die EF-Zelle (E/F merged in ef_row).
+    # Wenn dort Text steht, liefert sie pairs (nicht None).
     pairs, m, ok = _pairs_from_ef_word(sheet, ef_row, f"EF{ef_row}")
+    
+    # Meldungen (z.B. ">8 Zeichen gekürzt") werden gesammelt
     if m:
         state["msgs"].extend([f"{title}: {x}" for x in m])
+    # WICHTIG:
+    # Sobald EF verwendet werden kann -> RETURN.
+    # Das beendet DIE GANZE FUNKTION.
+    # GRID und RANDOM werden dann NICHT mehr geprüft.
     if pairs is not None:
-        return pairs, ok, True  # used_word=True
+        return pairs, ok, "EF"
+    
+    # ============================================================
+    # 2) GRID (zweite Priorität, nur wenn EF leer war)
+    # ============================================================
+    # Hier lesen wir C..F in grid_row und bauen daraus 4 Paare.
+    gr = _pairs_from_grid_row(sheet, grid_row)
 
-    # 2) Grid
-    gpairs, gm, gword = _pairs_from_grid_row(sheet, grid_row)
+    _gword = ""  # <<< NEU: Default immer setzen
+
+    # kompatibel: Funktion kann 2 oder 3 Werte liefern
+    if isinstance(gr, tuple) and len(gr) == 3:
+        gpairs, gm, _gword = gr     # _gword = zusammengesetztes Wort (für Log Y/Z)
+    else:
+        gpairs, gm = gr            
+       # _gword = ""               # falls alte Version ohne _gword
+        
+    # Hinweise aus dem Grid (z.B. "zu viele Zeichen -> gekürzt")
     if gm:
         state["msgs"].extend([f"{title}: {x}" for x in gm])
 
+    # _grid_all_empty prüft: sind alle 4 Paare leer ("  " etc.)?
+    # Wenn NICHT alles leer ist, dann wurde im Grid etwas eingegeben.
     if not _grid_all_empty(gpairs):
-        # LOG: Wort + Timestamp in Y/Z derselben Zeile wie das Grid
-        _log_used_word(sheet, grid_row, gword)
-        return gpairs, True, True
+        # OPTIONAL (dein Wunsch aus dem anderen Schritt):
+        # Wenn Grid benutzt wird, Wort + Timestamp in Y/Z derselben Zeile loggen.
+        # -> Y<grid_row> / Z<grid_row>        
+        try:
+            _log_used_word(sheet, grid_row, _gword)
+        except Exception:
+            pass
 
-    # 3) Random (NUR wenn erlaubt)
+        # WICHTIG:
+        # Sobald GRID verwendet werden kann -> RETURN.
+        # RANDOM wird dann NICHT mehr geprüft.
+        return gpairs, True, "GRID"  
+
+    # ============================================================
+    # 3) RANDOM (dritte Priorität, nur wenn EF und GRID leer waren)
+    # ============================================================
+    # Wenn keine Random-Füllungen mehr erlaubt sind, geben wir "leer" zurück.
     if state["remaining_random"] <= 0:
-        return ["  ","  ","  ","  "], True, False
+        return ["  ", "  ", "  ", "  "], True, "EMPTY"
 
+    # Zufälliges Wort aus den Wortlisten holen
     w, col_letters, row1 = _pick_random_word(sheet)
+    
+    # Wenn kein Kandidat gefunden: leer zurück
     if not w:
         if DEBUG:
             state["msgs"].append(f"{title}: keine Random-Kandidaten gefunden")
-        return ["  ","  ","  ","  "], True, False
-        
-        
-    if DEBUG:
-        state["msgs"].append(f"{title}: Random gewählt '{w}' aus {col_letters}{row1} (remaining_random vorher={state['remaining_random']})")
+        return ["  ", "  ", "  ", "  "], True, "EMPTY"
 
-
-    # <<< IMPORTANT: Random NICHT nach EF/Grid zurückschreiben!
-    # Nur in Wortliste (+3/+4) markieren:
+    # Wichtig: Random NICHT nach EF/Grid/Y zurückschreiben!
+    # Random-Wort nur in der Wortliste als benutzt markieren (+3/+4)
     _mark_word_used(sheet, col_letters, row1, w)
     state["remaining_random"] -= 1
 
@@ -667,8 +709,9 @@ def _pairs_for_half(sheet, title, ef_row, grid_row, state):
             pairs.append(chunk + " ")
         else:
             pairs.append("  ")
-    return pairs, True, True
-    
+
+    return pairs, True, "RANDOM"
+
 # =========================
 # LOG: Y/Z (Wort + Timestamp)
 # =========================
@@ -771,78 +814,55 @@ def clear_circle_contents_and_cells(*args):
 
 
 # =========================
-# KREISE SHUFFLEN (nur Positionen tauschen)
+# „BUTTON ROTATE“/„Rotation“
 # =========================
-def _shapes_for_idx_tag(draw_page, idx_tag: str):
-    """
-    Findet alle Shapes, die zu einem Kreis gehören (circle, v, h, text_..)
-    anhand des idx_tag (z.B. "b0_c2").
-    """
-    out = []
-    needle = f"_{idx_tag}"
-    for i in range(draw_page.getCount()):
-        sh = draw_page.getByIndex(i)
-        try:
-            nm = getattr(sh, "Name", "") or ""
-        except Exception:
-            nm = ""
-        if needle in nm:
-            out.append(sh)
-    return out
-
-
-def _move_shapes_x(shapes, dx: int):
-    for sh in shapes:
-        try:
-            p = sh.Position
-            sh.Position = Point(int(p.X + dx), int(p.Y))
-        except Exception:
-            pass
-
-
 def rotate_letters_in_circles_and_clear_cells(*args):
     """
     Button-Funktion:
     - dreht NUR die Buchstaben innerhalb jedes Kreises (keine Positionsänderung der Kreise)
-    - 0° (Ausgangsposition) ist erlaubt, aber höchstens 1 Kreis insgesamt darf 0° haben
-      (es muss keiner 0° haben)
+    - 0° ist erlaubt, aber höchstens 1 Kreis insgesamt darf 0° haben (es muss keiner 0° haben)
     - alle Kreise werden behandelt (auch wenn leer/teil-leer)
     - danach C3:F17 leeren (Format bleibt)
     """
-    doc = _get_doc()
-    sheet = _get_sheet(doc)
-    dp = _get_draw_page(sheet)
-
-    doc.lockControllers()
+    global SUPPRESS_AUTO_RUN
+    SUPPRESS_AUTO_RUN = True
     try:
-        # Alle Kreis-Tags sammeln (z.B. b0_c0 ... b2_c3)
-        tags = []
-        for gi in range(len(GROUPS)):
-            for c in range(NUM_COLS):
-                tags.append(f"b{gi}_c{c}")
+        doc = _get_doc()
+        sheet = _get_sheet(doc)
+        dp = _get_draw_page(sheet)
 
-        # Standard: alle drehen (1/2/3 = 90/180/270 cw; 3 entspricht 90° ccw)
-        steps_map = {tag: random.choice([1, 2, 3]) for tag in tags}
+        doc.lockControllers()
+        try:
+            # Alle Kreis-Tags sammeln (z.B. b0_c0 ... b2_c3)
+            tags = []
+            for gi in range(len(GROUPS)):
+                for c in range(NUM_COLS):
+                    tags.append(f"b{gi}_c{c}")
 
-        # Optional: genau 1 Kreis darf 0° behalten
-        if random.choice([True, False]):  # 50/50 ob überhaupt einer 0° hat
-            keep_zero_tag = random.choice(tags)
-            steps_map[keep_zero_tag] = 0
+            # Standard: alle drehen (1/2/3 = 90/180/270 cw; 3 entspricht 90° ccw)
+            steps_map = {tag: random.choice([1, 2, 3]) for tag in tags}
 
-        # Anwenden
-        for tag, steps in steps_map.items():
-            _rotate_one_circle_letters(dp, tag, steps)
+            # Optional: genau 1 Kreis darf 0° behalten
+            if random.choice([True, False]):
+                steps_map[random.choice(tags)] = 0
 
-        # Eingabebereich leeren (Format bleibt)
-        _clear_cells_keep_format(sheet, "C3:F17")
+            # Anwenden
+            for tag, steps in steps_map.items():
+                _rotate_one_circle_letters(dp, tag, steps)
+
+            # Eingabebereich leeren (Format bleibt)
+            _clear_cells_keep_format(sheet, "C3:F17")
+
+        finally:
+            try:
+                doc.unlockControllers()
+            except Exception:
+                pass
+
+        return True
 
     finally:
-        try:
-            doc.unlockControllers()
-        except Exception:
-            pass
-
-    return True
+        SUPPRESS_AUTO_RUN = False
 
 
 # =========================
@@ -865,6 +885,10 @@ def _init_yz_format(sheet, rows: int = 100):
 # Button: immer neu zeichnen
 # =========================
 def run_wordspiel_button(*args):
+    global SUPPRESS_AUTO_RUN
+    if SUPPRESS_AUTO_RUN:
+        return True    
+    
     doc = _get_doc()
     sheet = _get_sheet(doc)
     dp = _get_draw_page(sheet)
@@ -898,8 +922,11 @@ def run_wordspiel_button(*args):
         delete_all_circles()
 
         for gi, (title, ef_top, grid_top, grid_bot, ef_bot) in enumerate(GROUPS):
-            top_pairs, ok1, _used1 = _pairs_for_half(sheet, title, ef_top, grid_top, state)
-            bot_pairs, ok2, _used2 = _pairs_for_half(sheet, title, ef_bot, grid_bot, state)
+
+            top_pairs, ok1, src_top = _pairs_for_half(sheet, title, ef_top, grid_top, state)
+            bot_pairs, ok2, src_bot = _pairs_for_half(sheet, title, ef_bot, grid_bot, state)
+
+
 
             # <<< CHANGE: wir brechen NICHT mehr wegen EF <5 ab (ok ist praktisch immer True)
             if not (ok1 and ok2):
@@ -921,6 +948,11 @@ def run_wordspiel_button(*args):
 
                 x = START_X + c * OFFSET_X_BASE
                 _draw_circle(doc, dp, x, y, CIRCLE_DIAMETER, fill, quad, idx_tag)
+                
+            # >>> HIER GENAU: NACHDEM alle 4 Kreise dieses Blocks gezeichnet sind
+            if src_top == "RANDOM" and src_bot == "RANDOM":
+                _rotate_block_if_two_random(dp, gi)
+                
 
     finally:
         try:

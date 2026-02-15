@@ -50,7 +50,7 @@ SHEET_NAME = "KREIS_WORTRAETSEL"
 CAND_COL_WORD0   = 26   # AA
 CAND_COL_STATUS0 = 27   # AB
 CAND_START_ROW_1BASED = 4
-CAND_MAX_ROWS = 1000
+CAND_MAX_ROWS = 500
 
 # AB column width
 AB_WIDTH_CM = 12.0
@@ -386,18 +386,17 @@ def _count_nonempty_in_col(sheet, col0: int, start_row_1based: int, max_rows: in
         if s:
             n += 1
     return n
-
+        
 def _write_count_cell(sheet, col0: int, row_1based: int, n: int):
-    # Text in eine einzelne Zelle schreiben, zentriert
     r0 = row_1based - 1
     cell = sheet.getCellByPosition(col0, r0)
+
     cell.setString(f"Anzahl Wörter:\n{n}")
-    try:
-        cell.HoriJustify = _h("CENTER")
-        cell.VertJustify = _v("CENTER")
-        cell.IsTextWrapped = True
-    except Exception:
-        pass
+
+    cell.HoriJustify = uno.Enum("com.sun.star.table.CellHoriJustify", "CENTER")
+    cell.VertJustify = uno.Enum("com.sun.star.table.CellVertJustify", "CENTER")
+    cell.IsTextWrapped = True
+    cell.CharHeight = 11.0
 
 def _update_all_wordlist_counts(sheet):
     """
@@ -432,7 +431,7 @@ def _write_label_cell(sheet, col0: int, row_1based: int, text: str):
         cell.HoriJustify = uno.Enum("com.sun.star.table.CellHoriJustify", "CENTER")
         cell.VertJustify = uno.Enum("com.sun.star.table.CellVertJustify", "CENTER")
         cell.IsTextWrapped = True
-        cell.CharHeight = 12
+        cell.CharHeight = 11
     except Exception:
         pass
 
@@ -441,6 +440,52 @@ def _update_timestamp_labels_row2(sheet):
         wc0 = _word_col0_for_len(L)
         _write_label_cell(sheet, wc0 + TS_IMPORT_OFFSET, 2, "Import\nZeit")
         _write_label_cell(sheet, wc0 + TS_USED_OFFSET,   2, "Kreis\nZeit (30T)")
+
+ # =========================
+# KANDIDATENBEREICH LEEREN (bis letzte gefüllte Zeile, Format bleibt)
+# =========================      
+def clear_candidates_AA_AB(*args):
+    """
+    Button: löscht nur Inhalte (Text/Wert/Formel), lässt Formatierungen stehen.
+    Bereich: AA4:AB<letzte gefüllte Zeile in AA oder AB>
+    """
+    doc = _get_doc()
+    sheet = _get_sheet(doc)
+
+    # Cursor weg von Eingabezelle, damit aktuelle Eingabe übernommen wird
+    _goto_cell(doc, SHEET_NAME, "Z4")
+
+    start_row = CAND_START_ROW_1BASED  # = 4
+    start0 = start_row - 1
+    end0 = start0 + CAND_MAX_ROWS - 1  # Sicherheitslimit (z.B. 1000 Zeilen)
+
+    last0 = None  # 0-based letzte gefüllte Zeile
+
+    # Wir prüfen AA (CAND_COL_WORD0) und AB (CAND_COL_STATUS0)
+    for r0 in range(end0, start0 - 1, -1):
+        aa = (sheet.getCellByPosition(CAND_COL_WORD0, r0).getString() or "").strip()
+        ab = (sheet.getCellByPosition(CAND_COL_STATUS0, r0).getString() or "").strip()
+        if aa or ab:
+            last0 = r0
+            break
+
+    # Nichts gefunden -> nichts zu löschen
+    if last0 is None:
+        return True
+
+    last_row_1based = last0 + 1
+    rng_a1 = f"AA{start_row}:AB{last_row_1based}"
+
+    doc.lockControllers()
+    try:
+        rng = sheet.getCellRangeByName(rng_a1)
+        flags = (1 | 2 | 4 | 16)  # VALUE|DATETIME|STRING|FORMULA
+        rng.clearContents(flags)
+    finally:
+        doc.unlockControllers()
+
+    return True
+
 
 # ============================================================
 # 7) MAIN MACRO
@@ -460,7 +505,7 @@ def import_candidates_from_AA(*args):
         _msgbox("Import", f"Sheet '{SHEET_NAME}' nicht gefunden.")
         return False
         
-    _goto_cell(doc, SHEET_NAME, "C4")   # Cursor weg von der Eingabezelle -> übernimmt Edit-Inhalt
+    _goto_cell(doc, SHEET_NAME, "Z4")   # Cursor weg von der Eingabezelle -> übernimmt Edit-Inhalt
 
     # Set AB width
     _set_col_width(sheet, CAND_COL_STATUS0, _cm_to_u100mm(AB_WIDTH_CM))
@@ -560,4 +605,5 @@ g_exportedScripts = (
     import_candidates_from_AA,
     show_wordlists,
     hide_wordlists,
+    clear_candidates_AA_AB,
 )
